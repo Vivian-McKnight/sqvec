@@ -1,7 +1,8 @@
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
+use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
-// use std::ptr::Unique;
 
 // todo
 // - add shrinking the array to size
@@ -17,17 +18,33 @@ use std::ptr::NonNull;
 // - insert
 // - remove
 // - store seglen instead of log_seglen?
+// - zero sized types
+// - dropck/phantomdata?
+// - benchmark different iteration strategies
+// - benchmark random operations against vec
+// - iter_mut()
 
-#[derive(Debug)]
+/// A non-contiguos extensible array that achieves asymptotically optimal
+/// space overhead of O(√n)). Specification: <https://jmmackenzie.io/pdf/mm22-adcs.pdf>
 pub struct SqVec<T> {
     dope: NonNull<NonNull<T>>,
     dope_cap: u32,
     len: u32,
     alloc_seg_count: u32,
     log_seglen: u32,
+    _owns_t: PhantomData<T>,
+}
+
+impl<T: Debug> Debug for SqVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 impl<T> SqVec<T> {
+    /// Constructs a new, empty `SqVec<T>`.
+    ///
+    /// The sqvec will not allocate until elements are pushed onto it.
     pub fn new() -> Self {
         assert!(
             std::mem::size_of::<T>() != 0,
@@ -39,9 +56,11 @@ impl<T> SqVec<T> {
             len: 0,
             alloc_seg_count: 0,
             log_seglen: 1,
+            _owns_t: PhantomData,
         }
     }
 
+    /// grows the dope vector to the correct size to fit the next set of segments
     fn grow_dope(&mut self) {
         let (new_cap, new_layout) = if self.dope_cap == 0 {
             (2, Layout::array::<NonNull<T>>(2).unwrap())
@@ -50,6 +69,11 @@ impl<T> SqVec<T> {
             let new_layout = Layout::array::<NonNull<T>>(new_cap as usize).unwrap();
             (new_cap, new_layout)
         };
+
+        assert!(
+            new_layout.size() <= isize::MAX as usize,
+            "Allocation too large"
+        );
 
         let handle = if self.dope_cap == 0 {
             unsafe { alloc(new_layout) }
@@ -65,12 +89,14 @@ impl<T> SqVec<T> {
     }
 
     /// Allocates a new segment of length `1 << self.log_seglen` at index `segnum` in dope.
-    fn alloc_seg(&mut self, segnum: u32) {
+    ///
+    /// This function assumes no segment is allocated at `segnum`.
+    fn alloc_seg(&mut self) {
         let layout = Layout::array::<T>(1 << self.log_seglen).unwrap();
         let handle = unsafe { alloc(layout) };
         let ptr =
             NonNull::new(handle as *mut T).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        unsafe { self.dope.add(segnum as usize).write(ptr) };
+        unsafe { self.dope.add(self.alloc_seg_count as usize).write(ptr) };
         self.alloc_seg_count += 1;
     }
 
@@ -85,7 +111,7 @@ impl<T> SqVec<T> {
                 if segnum == self.dope_cap {
                     self.grow_dope();
                 }
-                self.alloc_seg(segnum);
+                self.alloc_seg();
             }
         }
         unsafe { self.item_ptr_inner(segnum, offset).write(val) };
@@ -103,11 +129,16 @@ impl<T> SqVec<T> {
         if (segnum == Self::first_seg(self.log_seglen)) && (offset == 0) {
             self.log_seglen = 1.max(self.log_seglen - 1);
         }
-        unsafe { Some(self.item_ptr_inner(segnum, offset).read()) }
+        Some(unsafe { self.item_ptr_inner(segnum, offset).read() })
     }
 
+    /// swaps the elements at index's ix1 and ix2
     pub fn swap(&mut self, ix1: u32, ix2: u32) {
         assert!(ix1 < self.len && ix2 < self.len, "Index out of range");
+        unsafe { self.swap_unchecked(ix1, ix2) };
+    }
+
+    pub unsafe fn swap_unchecked(&mut self, ix1: u32, ix2: u32) {
         unsafe { std::mem::swap(self.item_ptr(ix1).as_mut(), self.item_ptr(ix2).as_mut()) };
     }
 
@@ -117,6 +148,7 @@ impl<T> SqVec<T> {
         self.len
     }
 
+    /// Returns true if the sqvec is empty and false otherwise
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
@@ -139,7 +171,7 @@ impl<T> SqVec<T> {
     /// Gives the dope index of the first segment of length (1 << log_seglen)
     #[inline(always)]
     fn first_seg(log_seglen: u32) -> u32 {
-        if log_seglen == 1 {
+        if std::intrinsics::unlikely(log_seglen == 1) {
             0
         } else {
             3 * (1 << (log_seglen - 2)) - 1
@@ -152,9 +184,11 @@ impl<T> SqVec<T> {
         3 * (1 << (log_seglen - 1)) - 2
     }
 
+    /// Returns the max number of segments of lenght (1 << log_seglen) that can
+    /// be allocated
     #[inline(always)]
     fn segs_of_len(log_seglen: u32) -> u32 {
-        if log_seglen == 1 {
+        if std::intrinsics::unlikely(log_seglen == 1) {
             2
         } else {
             3 * (1 << (log_seglen - 2))
@@ -168,20 +202,95 @@ impl<T> SqVec<T> {
         unsafe { self.item_ptr_inner(segnum, offset) }
     }
 
+    ///
     #[inline(always)]
     unsafe fn item_ptr_inner(&self, segnum: u32, offset: u32) -> NonNull<T> {
         unsafe { self.dope.add(segnum as usize).read().add(offset as usize) }
     }
 
-    fn iter(&self) -> Iter<'_, T> {
+    fn iter(&self) -> Iter<T> {
         Iter {
             data: &self,
             seglen: 2,
             segnum: 0,
             offset: 0,
             last_seg_ix_of_len: 1,
-            len: 0,
+            ix: 0,
         }
+    }
+
+    fn t_iter(&self) -> TIter<T> {
+        TIter { data: &self, ix: 0 }
+    }
+}
+
+pub struct IterMut<'a, T> {
+    data: &'a SqVec<T>,
+    ix: u32,
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ix == self.data.len() {
+            return None;
+        }
+        let out = unsafe { self.data.item_ptr(self.ix).as_mut() };
+        self.ix += 1;
+        return Some(out);
+    }
+}
+
+pub struct TIter<'a, T> {
+    data: &'a SqVec<T>,
+    ix: u32,
+}
+
+impl<'a, T> Iterator for TIter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ix == self.data.len() {
+            return None;
+        }
+        let out = unsafe { self.data.item_ptr(self.ix).as_ref() };
+        self.ix += 1;
+        return Some(out);
+    }
+}
+
+pub struct Iter<'a, T> {
+    data: &'a SqVec<T>,
+    seglen: u32,
+    segnum: u32,
+    offset: u32,
+    last_seg_ix_of_len: u32,
+    ix: u32,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ix == self.data.len() {
+            return None;
+        }
+
+        if self.offset == self.seglen {
+            // next segnum... also check wether seglen should double
+            if self.segnum == self.last_seg_ix_of_len {
+                self.last_seg_ix_of_len = 3 * self.seglen - 2;
+                self.seglen <<= 1;
+            }
+            self.segnum += 1;
+            self.offset = 0;
+        }
+
+        let out = unsafe { self.data.item_ptr_inner(self.segnum, self.offset).as_ref() };
+        self.offset += 1;
+        self.ix += 1;
+        return Some(out);
     }
 }
 
@@ -198,30 +307,6 @@ impl<T> IndexMut<u32> for SqVec<T> {
     fn index_mut(&mut self, ix: u32) -> &mut Self::Output {
         assert!(ix < self.len, "Index out of bounds.");
         unsafe { self.item_ptr(ix).as_mut() }
-    }
-}
-
-pub struct Iter<'a, T> {
-    data: &'a SqVec<T>,
-    seglen: u32,
-    segnum: u32,
-    offset: u32,
-    last_seg_ix_of_len: u32,
-    len: u32,
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.len == self.data.len() {
-            return None;
-        }
-        if self.len == self.last_seg_ix_of_len {
-            todo!();
-        }
-
-        todo!();
     }
 }
 
@@ -258,6 +343,9 @@ impl<T> Drop for SqVec<T> {
     }
 }
 
+unsafe impl<T: Send> Send for SqVec<T> {}
+unsafe impl<T: Sync> Sync for SqVec<T> {}
+
 #[cfg(test)]
 mod tests {
     use super::SqVec;
@@ -283,7 +371,7 @@ mod tests {
 
     #[test]
     fn drop_empty() {
-        let _sqvec = SqVec::<u32>::new();
+        let _sqvec = SqVec::<Box<u32>>::new();
     }
 
     #[test]
@@ -313,5 +401,39 @@ mod tests {
             };
             assert_eq!(vec.len(), sqvec.len() as usize);
         }
+    }
+
+    #[test]
+    fn lifetime() {
+        let mut sqvec = SqVec::<Box<u32>>::new();
+        sqvec.push(Box::new(23));
+        let a = sqvec.pop().unwrap();
+        drop(a);
+        sqvec.push(Box::new(324));
+    }
+
+    #[test]
+    fn iteration() {
+        let mut rng = thread_rng();
+        let mut sqvec = SqVec::<u32>::new();
+        let mut vec = Vec::<u32>::new();
+        for _ in 0u32..2048 {
+            let a = rng.r#gen();
+            sqvec.push(a);
+            vec.push(a);
+        }
+        let mut sqiter = sqvec.iter();
+        let mut viter = vec.iter();
+        for i in 0u32..2048 {
+            assert_eq!(sqiter.next(), viter.next(), "{i}");
+        }
+    }
+
+    #[test]
+    fn debug_print() {
+        let mut sqvec = SqVec::<u32>::new();
+        sqvec.push(2);
+        sqvec.push(6);
+        println!("{sqvec:?}")
     }
 }
