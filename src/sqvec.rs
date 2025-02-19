@@ -6,7 +6,6 @@ use std::ptr::NonNull;
 
 // todo
 // - add shrinking the array to size
-// - iterator
 // - efficient item drop
 // - c interop
 // - size checks/debug assertions
@@ -23,6 +22,7 @@ use std::ptr::NonNull;
 // - benchmark different iteration strategies
 // - benchmark random operations against vec
 // - iter_mut()
+// - usize as index?
 
 /// A non-contiguos extensible array that achieves asymptotically optimal
 /// space overhead of O(√n)). Specification: <https://jmmackenzie.io/pdf/mm22-adcs.pdf>
@@ -63,22 +63,21 @@ impl<T> SqVec<T> {
     /// grows the dope vector to the correct size to fit the next set of segments
     fn grow_dope(&mut self) {
         let (new_cap, new_layout) = if self.dope_cap == 0 {
-            (2, Layout::array::<NonNull<T>>(2).unwrap())
+            (2, unsafe {
+                Layout::array::<NonNull<T>>(2).unwrap_unchecked()
+            })
         } else {
             let new_cap = self.dope_cap + Self::segs_of_len(self.log_seglen);
-            let new_layout = Layout::array::<NonNull<T>>(new_cap as usize).unwrap();
+            let new_layout =
+                Layout::array::<NonNull<T>>(new_cap as usize).expect("Allocation too large");
             (new_cap, new_layout)
         };
-
-        assert!(
-            new_layout.size() <= isize::MAX as usize,
-            "Allocation too large"
-        );
 
         let handle = if self.dope_cap == 0 {
             unsafe { alloc(new_layout) }
         } else {
-            let old_layout = Layout::array::<NonNull<T>>(self.dope_cap as usize).unwrap();
+            let old_layout =
+                unsafe { Layout::array::<NonNull<T>>(self.dope_cap as usize).unwrap_unchecked() };
             let old_handle = self.dope.as_ptr() as *mut u8;
             unsafe { realloc(old_handle, old_layout, new_layout.size()) }
         };
@@ -92,7 +91,7 @@ impl<T> SqVec<T> {
     ///
     /// This function assumes no segment is allocated at `segnum`.
     fn alloc_seg(&mut self) {
-        let layout = Layout::array::<T>(1 << self.log_seglen).unwrap();
+        let layout = Layout::array::<T>(1 << self.log_seglen).expect("Allocation too large");
         let handle = unsafe { alloc(layout) };
         let ptr =
             NonNull::new(handle as *mut T).unwrap_or_else(|| alloc::handle_alloc_error(layout));
@@ -427,13 +426,5 @@ mod tests {
         for i in 0u32..2048 {
             assert_eq!(sqiter.next(), viter.next(), "{i}");
         }
-    }
-
-    #[test]
-    fn debug_print() {
-        let mut sqvec = SqVec::<u32>::new();
-        sqvec.push(2);
-        sqvec.push(6);
-        println!("{sqvec:?}")
     }
 }
