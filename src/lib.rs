@@ -3,5 +3,6 @@
 #![allow(dead_code)]
 #![allow(internal_features)]
 #![feature(core_intrinsics)]
+
 pub mod sqvec;
 pub use sqvec::SqVec;
