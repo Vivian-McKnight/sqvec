@@ -1,6 +1,7 @@
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
 
@@ -22,14 +23,13 @@ use std::ptr::NonNull;
 // - usize as index?
 
 /// A non-contiguos extensible array that achieves asymptotically optimal
-/// space overhead of O(√n) while maintaining comparable time complexity.
+/// space overhead of O(√n) while maintaining comparable time efficiency**.
 /// Specification: <https://jmmackenzie.io/pdf/mm22-adcs.pdf>
 pub struct SqVec<T> {
     dope: NonNull<NonNull<T>>,
     dope_cap: u32,
     len: u32,
     alloc_seg_count: u32,
-    log_seglen: u32,
     marker: PhantomData<T>,
 }
 
@@ -60,9 +60,13 @@ impl<T> SqVec<T> {
             dope_cap: 0,
             len: 0,
             alloc_seg_count: 0,
-            log_seglen: 1,
             marker: PhantomData,
         }
+    }
+
+    /// calculates the dope_cap from `self.alloc_seg_count`
+    fn dope_cap(&self) -> u32 {
+        todo!()
     }
 
     /// grows the dope vector to the correct size to fit the next set of segments
@@ -72,7 +76,7 @@ impl<T> SqVec<T> {
                 Layout::array::<NonNull<T>>(2).unwrap_unchecked()
             })
         } else {
-            let new_cap = self.dope_cap + Self::segs_of_len(self.log_seglen);
+            let new_cap = self.dope_cap + Self::segs_of_len(Self::lsln(self.len - 1));
             let new_layout =
                 Layout::array::<NonNull<T>>(new_cap as usize).expect("Allocation too large");
             (new_cap, new_layout)
@@ -95,7 +99,7 @@ impl<T> SqVec<T> {
 
     /// Allocates a new segment of length `1 << self.log_seglen` at index `self.alloc_seg_count` in dope.
     fn alloc_seg(&mut self) {
-        let layout = Layout::array::<T>(1 << self.log_seglen).expect("Allocation too large");
+        let layout = Layout::array::<T>(1 << Self::lsln(self.len)).expect("Allocation too large");
         let handle = unsafe { alloc(layout) };
         let ptr =
             NonNull::new(handle as *mut T).unwrap_or_else(|| alloc::handle_alloc_error(layout));
@@ -107,9 +111,6 @@ impl<T> SqVec<T> {
     pub fn push(&mut self, val: T) {
         let (segnum, offset) = Self::mapping(self.len);
         if offset == 0 {
-            if segnum == Self::last_seg(self.log_seglen) + 1 {
-                self.log_seglen += 1;
-            }
             if segnum == self.alloc_seg_count {
                 if segnum == self.dope_cap {
                     self.grow_dope();
@@ -124,15 +125,12 @@ impl<T> SqVec<T> {
     /// Removes the last value on the SqVec and returns it in an Option.
     /// If the SqVec is empty, Returns None
     pub fn pop(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
+        if core::hint::unlikely(self.len == 0) {
+            None
+        } else {
+            self.len -= 1;
+            Some(unsafe { self.item_ptr(self.len).read() })
         }
-        self.len -= 1;
-        let (segnum, offset) = Self::mapping(self.len);
-        if (segnum == Self::first_seg(self.log_seglen)) && (offset == 0) {
-            self.log_seglen = 1.max(self.log_seglen - 1);
-        }
-        Some(unsafe { self.item_ptr_inner(segnum, offset).read() })
     }
 
     /// swaps the elements at index's ix1 and ix2
@@ -143,7 +141,7 @@ impl<T> SqVec<T> {
 
     /// swaps the elements at index's ix1 and ix2 without checking ix1 or ix2 in range
     pub unsafe fn swap_unchecked(&mut self, ix1: u32, ix2: u32) {
-        unsafe { std::mem::swap(self.item_ptr(ix1).as_mut(), self.item_ptr(ix2).as_mut()) };
+        unsafe { mem::swap(self.item_ptr(ix1).as_mut(), self.item_ptr(ix2).as_mut()) };
     }
 
     /// Returns the length of the SqVec (number of elements)
@@ -162,7 +160,7 @@ impl<T> SqVec<T> {
     /// segment (offset) where the element at index `v` can be found.
     #[inline]
     fn mapping(v: u32) -> (u32, u32) {
-        let b = if std::intrinsics::unlikely(v == 0) {
+        let b = if core::hint::unlikely(v == 0) {
             1
         } else {
             (33 - v.leading_zeros()) >> 1
@@ -175,7 +173,7 @@ impl<T> SqVec<T> {
     /// Gives the dope index of the first segment of length (1 << log_seglen)
     #[inline]
     fn first_seg(log_seglen: u32) -> u32 {
-        if std::intrinsics::unlikely(log_seglen == 1) {
+        if core::hint::unlikely(log_seglen == 1) {
             0
         } else {
             3 * (1 << (log_seglen - 2)) - 1
@@ -192,7 +190,7 @@ impl<T> SqVec<T> {
     /// be allocated
     #[inline]
     fn segs_of_len(log_seglen: u32) -> u32 {
-        if std::intrinsics::unlikely(log_seglen == 1) {
+        if core::hint::unlikely(log_seglen == 1) {
             2
         } else {
             3 * (1 << (log_seglen - 2))
@@ -206,46 +204,49 @@ impl<T> SqVec<T> {
         unsafe { self.item_ptr_inner(segnum, offset) }
     }
 
-    ///
     #[inline]
     unsafe fn item_ptr_inner(&self, segnum: u32, offset: u32) -> NonNull<T> {
         unsafe { self.dope.add(segnum as usize).read().add(offset as usize) }
     }
 
-    fn iter(&self) -> Iter<T> {
-        Iter {
-            data: &self,
-            seglen: 2,
-            segnum: 0,
-            offset: 0,
-            last_seg_ix_of_len: 1,
-            ix: 0,
-        }
+    pub fn iter(&self) -> Iter<T> {
+        Iter { data: &self, ix: 0 }
     }
 
-    fn iter_mut(&mut self) -> IterMut<T> {
+    pub fn iter_t(&self) {
+        todo!()
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<T> {
         IterMut { data: self, ix: 0 }
     }
 
-    fn t_iter(&self) -> TIter<T> {
-        TIter { data: &self, ix: 0 }
-    }
-
-    fn log_seglen(ix: u32) -> u32 {
-        ix.next_power_of_two() / 2
+    /// calculates the log base 2 segment length of the
+    /// segment that the element at index `v` would be located
+    #[inline]
+    fn lsln(v: u32) -> u32 {
+        if v == 0 {
+            return 1;
+        }
+        (32 - v.leading_zeros()).div_ceil(2)
     }
 
     /// clears the sqvec dropping all present elements but
     /// maintaining the currently allocated space
     fn clear(&mut self) {
-        if std::mem::needs_drop::<T>() {
+        if mem::needs_drop::<T>() {
             for i in 0..self.len {
                 unsafe { self.item_ptr(i).drop_in_place() };
             }
         }
         self.len = 0;
-        self.log_seglen = 1;
     }
+}
+
+pub struct IterT<'a, T> {
+    dope_slice: std::slice::Iter<'a, T>,
+    seg_slice: std::slice::Iter<'a, T>,
+    seglen: u32,
 }
 
 impl<T> Drop for SqVec<T> {
@@ -254,7 +255,7 @@ impl<T> Drop for SqVec<T> {
             return;
         }
         // drop items in SqVec
-        if std::mem::needs_drop::<T>() {
+        if mem::needs_drop::<T>() {
             for i in 0..self.len {
                 unsafe { self.item_ptr(i).drop_in_place() };
             }
@@ -301,12 +302,12 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     }
 }
 
-pub struct TIter<'a, T> {
+pub struct Iter<'a, T> {
     data: &'a SqVec<T>,
     ix: u32,
 }
 
-impl<'a, T> Iterator for TIter<'a, T> {
+impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -319,38 +320,10 @@ impl<'a, T> Iterator for TIter<'a, T> {
     }
 }
 
-pub struct Iter<'a, T> {
-    data: &'a SqVec<T>,
-    seglen: u32,
-    segnum: u32,
-    offset: u32,
-    last_seg_ix_of_len: u32,
-    ix: u32,
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ix == self.data.len() as u32 {
-            return None;
-        }
-
-        if self.offset == self.seglen {
-            // next segnum... also check wether seglen should double
-            if self.segnum == self.last_seg_ix_of_len {
-                self.last_seg_ix_of_len = 3 * self.seglen - 2;
-                self.seglen <<= 1;
-            }
-            self.segnum += 1;
-            self.offset = 0;
-        }
-
-        let out = unsafe { self.data.item_ptr_inner(self.segnum, self.offset).as_ref() };
-        self.offset += 1;
-        self.ix += 1;
-        return Some(out);
-    }
+pub struct TIter<'a, T> {
+    seg_ptr: NonNull<T>,
+    seg_ix: u32,
+    marker: PhantomData<&'a SqVec<T>>,
 }
 
 impl<T> Index<u32> for SqVec<T> {
@@ -485,37 +458,6 @@ mod tests {
         }
     }
 
-    fn lsln_seg(segnum: u32) -> u32 {
-        let a = next_pow((segnum + 2).div_ceil(3)) + 1;
-        // let a = ((segnum + 2).div_ceil(3) as f32).log2().ceil() as u32 + 1;
-        1 << a
-    }
-
-    fn lsln_v(v: u32) -> u32 {
-        let a = 32 - v.leading_zeros();
-        if v.is_power_of_two() {
-            let c = a - 1;
-            return a - 1;
-        }
-        if a % 2 != 0 {
-            return a + 1;
-        }
-        a
-    }
-
-    fn next_pow(x: u32) -> u32 {
-        if x.is_power_of_two() {
-            return 31 - x.leading_zeros();
-        }
-        32 - x.leading_zeros()
-        // (32 - x.leading_zeros()).min(31 - x.leading_zeros())
-    }
-
-    #[test]
-    fn log_seglen() {
-        println!("{}", 1 << lsln_v(4));
-    }
-
     #[test]
     fn equal() {
         let mut sqvec1: SqVec<u32> = SqVec::new();
@@ -534,5 +476,6 @@ mod tests {
 
         assert_ne!(sqvec!(3, 5, 2), sqvec!(2, 3));
         assert_ne!(sqvec!(33, 1, 34, 1), vec![23, 3, 5]);
+        assert_ne!(sqvec!(2, 3, 6), sqvec!(2, 3, 6, 5));
     }
 }
