@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dev-dependencies]
-rand = "0.8.5"
+criterion = "0.5.1"
+rand = "0.9"
+
+[[bench]]
+name = "benchmark"
+harness = false

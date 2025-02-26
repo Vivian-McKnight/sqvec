@@ -1,9 +1,9 @@
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
+use std::{hint, mem};
 
 // todo
 // - add shrinking the array to size
@@ -125,7 +125,7 @@ impl<T> SqVec<T> {
     /// Removes the last value on the SqVec and returns it in an Option.
     /// If the SqVec is empty, Returns None
     pub fn pop(&mut self) -> Option<T> {
-        if core::hint::unlikely(self.len == 0) {
+        if self.len == 0 {
             None
         } else {
             self.len -= 1;
@@ -160,7 +160,7 @@ impl<T> SqVec<T> {
     /// segment (offset) where the element at index `v` can be found.
     #[inline]
     fn mapping(v: u32) -> (u32, u32) {
-        let b = if core::hint::unlikely(v == 0) {
+        let b = if v == 0 {
             1
         } else {
             (33 - v.leading_zeros()) >> 1
@@ -173,7 +173,7 @@ impl<T> SqVec<T> {
     /// Gives the dope index of the first segment of length (1 << log_seglen)
     #[inline]
     fn first_seg(log_seglen: u32) -> u32 {
-        if core::hint::unlikely(log_seglen == 1) {
+        if log_seglen == 1 {
             0
         } else {
             3 * (1 << (log_seglen - 2)) - 1
@@ -190,7 +190,7 @@ impl<T> SqVec<T> {
     /// be allocated
     #[inline]
     fn segs_of_len(log_seglen: u32) -> u32 {
-        if core::hint::unlikely(log_seglen == 1) {
+        if log_seglen == 1 {
             2
         } else {
             3 * (1 << (log_seglen - 2))
@@ -211,10 +211,6 @@ impl<T> SqVec<T> {
 
     pub fn iter(&self) -> Iter<T> {
         Iter { data: &self, ix: 0 }
-    }
-
-    pub fn iter_t(&self) {
-        todo!()
     }
 
     pub fn iter_mut(&mut self) -> IterMut<T> {
@@ -241,12 +237,105 @@ impl<T> SqVec<T> {
         }
         self.len = 0;
     }
+
+    pub fn iter_t(&self) -> IterT<T> {
+        let (end_seg_ix, end_element_ix) = Self::mapping(self.len - 1);
+        IterT {
+            dope_iter: unsafe {
+                core::slice::from_raw_parts(
+                    self.dope.as_ptr() as *const NonNull<T>,
+                    end_seg_ix as usize,
+                )
+            }
+            .iter()
+            .copied(),
+            seg_iter: unsafe {
+                core::slice::from_raw_parts(
+                    self.dope.read().as_ptr() as *const T,
+                    2.min(self.len()),
+                )
+            }
+            .iter(),
+            end_seg_ptr: unsafe { self.dope.add(end_seg_ix as usize).read() },
+            end_seg_len: end_element_ix + 1,
+            segs_left: 2,
+            seglen: 2,
+            marker: PhantomData,
+        }
+    }
 }
 
-pub struct IterT<'a, T> {
-    dope_slice: std::slice::Iter<'a, T>,
-    seg_slice: std::slice::Iter<'a, T>,
+#[derive(Debug)]
+pub struct IterT<'a, T: 'a> {
+    dope_iter: core::iter::Copied<core::slice::Iter<'a, NonNull<T>>>,
+    seg_iter: core::slice::Iter<'a, T>,
+    end_seg_ptr: NonNull<T>,
+    end_seg_len: u32,
+    /// number of segments left of length seglen
+    segs_left: u32,
     seglen: u32,
+    marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for IterT<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.seg_iter.next() {
+            Some(item)
+        } else {
+            if let Some(ptr) = self.dope_iter.next() {
+                if self.segs_left == 0 {
+                    self.seglen <<= 1;
+                    self.segs_left = (3 * self.seglen) >> 1; // self.seglen will only ever be >= 4 at this point 👍
+                }
+
+                if ptr == self.end_seg_ptr {
+                    self.seg_iter = unsafe {
+                        core::slice::from_raw_parts(
+                            ptr.as_ptr() as *const T,
+                            self.end_seg_len as usize,
+                        )
+                    }
+                    .iter();
+                } else {
+                    self.seg_iter = unsafe {
+                        core::slice::from_raw_parts(ptr.as_ptr() as *const T, self.seglen as usize)
+                    }
+                    .iter();
+                }
+
+                self.segs_left -= 1;
+                self.seg_iter.next()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+struct DopeIter<'a, T: 'a> {
+    ptr: NonNull<NonNull<T>>,
+    end: NonNull<NonNull<T>>,
+    marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> DopeIter<'a, T> {
+    // fn new()
+}
+
+impl<'a, T> Iterator for DopeIter<'a, T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr > self.end {
+            None
+        } else {
+            let out = unsafe { self.ptr.read() };
+            self.ptr = unsafe { self.ptr.add(1) };
+            Some(out)
+        }
+    }
 }
 
 impl<T> Drop for SqVec<T> {
@@ -378,7 +467,7 @@ impl<T: PartialEq> PartialEq<SqVec<T>> for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::SqVec;
-    use rand::{Rng, random, thread_rng};
+    use rand::{Rng, random, rng, thread_rng};
 
     #[test]
     fn single_box_drop() {
@@ -442,19 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn a_titer() {
+        let mut sqvec = SqVec::<u32>::new();
+        for i in 0..2048 {
+            sqvec.push(i);
+        }
+        let mut si = sqvec.iter_t();
+        for _ in 0..4 {
+            si.next();
+            println!("{:?}", &si);
+        }
+    }
+
+    #[test]
     fn iteration() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut sqvec = SqVec::<u32>::new();
         let mut vec = Vec::<u32>::new();
         for _ in 0u32..2048 {
-            let a = rng.r#gen();
+            let a = rng.random();
             sqvec.push(a);
             vec.push(a);
         }
         let mut sqiter = sqvec.iter();
+        let mut sqiter2 = sqvec.iter_t();
         let mut viter = vec.iter();
         for i in 0u32..2048 {
-            assert_eq!(sqiter.next(), viter.next(), "{i}");
+            // assert_eq!(sqiter.next(), viter.next(), "{i}");
+            assert_eq!(sqiter.next(), sqiter2.next(), "{i}");
         }
     }
 
