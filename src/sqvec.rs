@@ -1,5 +1,5 @@
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
-use std::fmt::Debug;
+use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::ptr::NonNull;
@@ -244,7 +244,7 @@ impl<T> SqVec<T> {
             dope_iter: unsafe {
                 core::slice::from_raw_parts(
                     self.dope.as_ptr() as *const NonNull<T>,
-                    end_seg_ix as usize,
+                    end_seg_ix as usize + 1,
                 )
             }
             .iter()
@@ -265,7 +265,6 @@ impl<T> SqVec<T> {
     }
 }
 
-#[derive(Debug)]
 pub struct IterT<'a, T: 'a> {
     dope_iter: core::iter::Copied<core::slice::Iter<'a, NonNull<T>>>,
     seg_iter: core::slice::Iter<'a, T>,
@@ -275,6 +274,12 @@ pub struct IterT<'a, T: 'a> {
     segs_left: u32,
     seglen: u32,
     marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> Debug for IterT<'a, T> {
+    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
+        write!(f, "seglen: {}, segs_left: {}", self.seglen, self.segs_left)
+    }
 }
 
 impl<'a, T> Iterator for IterT<'a, T> {
@@ -533,13 +538,14 @@ mod tests {
     #[test]
     fn a_titer() {
         let mut sqvec = SqVec::<u32>::new();
-        for i in 0..2048 {
+        for i in 0..2 {
             sqvec.push(i);
         }
         let mut si = sqvec.iter_t();
-        for _ in 0..4 {
+        println!("{:#?}", &si);
+        for _ in 0..2 {
             si.next();
-            println!("{:?}", &si);
+            println!("{:#?}", &si);
         }
     }
 
