@@ -1,5 +1,4 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use rand::{Rng, rng};
 use sqvec::SqVec;
 
 fn push_benchmark_sqvec(c: &mut Criterion) {

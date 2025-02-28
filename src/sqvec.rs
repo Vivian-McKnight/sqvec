@@ -263,6 +263,49 @@ impl<T> SqVec<T> {
             marker: PhantomData,
         }
     }
+
+    pub fn iter_t2(&self) -> IterT2<T> {
+        IterT2 {
+            dope_ptrs: (self.dope, unsafe {
+                self.dope.add(Self::mapping(self.len - 1).0 as usize)
+            }),
+            seg_ptrs: unsafe { (self.dope.read(), self.dope.read().add(1)) },
+            seglen: 2,
+            segs_left: 2,
+            marker: PhantomData,
+        }
+    }
+}
+
+pub struct IterT2<'a, T: 'a> {
+    dope_ptrs: (NonNull<NonNull<T>>, NonNull<NonNull<T>>),
+    seg_ptrs: (NonNull<T>, NonNull<T>),
+    seglen: u32,
+    segs_left: u32,
+    marker: PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for IterT2<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.segs_left == 0 {
+            self.seglen <<= 2;
+            self.segs_left = (3 * self.seglen) >> 1;
+        }
+
+        if self.dope_ptrs.0 > self.dope_ptrs.1 {
+            return None;
+        }
+
+        if self.seg_ptrs.0 > self.seg_ptrs.1 {
+            self.dope_ptrs.0 = unsafe { self.dope_ptrs.0.add(1) };
+        }
+
+        self.seg_ptrs.0 = unsafe { self.seg_ptrs.0.add(1) };
+        self.segs_left -= 1;
+        todo!()
+    }
 }
 
 pub struct IterT<'a, T: 'a> {
@@ -315,30 +358,6 @@ impl<'a, T> Iterator for IterT<'a, T> {
             } else {
                 None
             }
-        }
-    }
-}
-
-struct DopeIter<'a, T: 'a> {
-    ptr: NonNull<NonNull<T>>,
-    end: NonNull<NonNull<T>>,
-    marker: PhantomData<&'a T>,
-}
-
-impl<'a, T> DopeIter<'a, T> {
-    // fn new()
-}
-
-impl<'a, T> Iterator for DopeIter<'a, T> {
-    type Item = NonNull<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ptr > self.end {
-            None
-        } else {
-            let out = unsafe { self.ptr.read() };
-            self.ptr = unsafe { self.ptr.add(1) };
-            Some(out)
         }
     }
 }
