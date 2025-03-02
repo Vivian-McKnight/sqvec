@@ -1,9 +1,9 @@
+use core::fmt::{Debug, Formatter};
+use core::marker::PhantomData;
+use core::mem;
+use core::ops::{Index, IndexMut};
+use core::ptr::NonNull;
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
-use std::fmt::{Debug, Formatter};
-use std::marker::PhantomData;
-use std::ops::{Index, IndexMut};
-use std::ptr::NonNull;
-use std::{hint, mem};
 
 // todo
 // - add shrinking the array to size
@@ -21,6 +21,7 @@ use std::{hint, mem};
 // - benchmark different iteration strategies
 // - benchmark random operations against vec
 // - usize as index?
+// - store last element ptr and segment details for faster push/pop?
 
 /// A non-contiguos extensible array that achieves asymptotically optimal
 /// space overhead of O(√n) while maintaining comparable time efficiency**.
@@ -209,14 +210,6 @@ impl<T> SqVec<T> {
         unsafe { self.dope.add(segnum as usize).read().add(offset as usize) }
     }
 
-    pub fn iter(&self) -> Iter<T> {
-        Iter { data: &self, ix: 0 }
-    }
-
-    pub fn iter_mut(&mut self) -> IterMut<T> {
-        IterMut { data: self, ix: 0 }
-    }
-
     /// calculates the log base 2 segment length of the
     /// segment that the element at index `v` would be located
     #[inline]
@@ -238,38 +231,13 @@ impl<T> SqVec<T> {
         self.len = 0;
     }
 
-    pub fn iter_t(&self) -> IterT<T> {
-        let (end_seg_ix, end_element_ix) = Self::mapping(self.len - 1);
-        IterT {
-            dope_iter: unsafe {
-                core::slice::from_raw_parts(
-                    self.dope.as_ptr() as *const NonNull<T>,
-                    end_seg_ix as usize + 1,
-                )
-            }
-            .iter()
-            .copied(),
-            seg_iter: unsafe {
-                core::slice::from_raw_parts(
-                    self.dope.read().as_ptr() as *const T,
-                    2.min(self.len()),
-                )
-            }
-            .iter(),
-            end_seg_ptr: unsafe { self.dope.add(end_seg_ix as usize).read() },
-            end_seg_len: end_element_ix + 1,
-            segs_left: 2,
-            seglen: 2,
-            marker: PhantomData,
-        }
-    }
-
-    pub fn iter_t2(&self) -> IterT2<T> {
-        IterT2 {
+    pub fn iter(&self) -> Iter<T> {
+        Iter {
             dope_ptrs: (self.dope, unsafe {
                 self.dope.add(Self::mapping(self.len - 1).0 as usize)
             }),
             seg_ptrs: unsafe { (self.dope.read(), self.dope.read().add(1)) },
+            last_element_plus_one: unsafe { self.item_ptr(self.len - 1).add(1) },
             seglen: 2,
             segs_left: 2,
             marker: PhantomData,
@@ -277,88 +245,38 @@ impl<T> SqVec<T> {
     }
 }
 
-pub struct IterT2<'a, T: 'a> {
+pub struct Iter<'a, T: 'a> {
     dope_ptrs: (NonNull<NonNull<T>>, NonNull<NonNull<T>>),
     seg_ptrs: (NonNull<T>, NonNull<T>),
+    last_element_plus_one: NonNull<T>,
     seglen: u32,
     segs_left: u32,
     marker: PhantomData<&'a T>,
 }
 
-impl<'a, T> Iterator for IterT2<'a, T> {
+impl<'a, T: 'a> Iterator for Iter<'a, T> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.segs_left == 0 {
-            self.seglen <<= 2;
-            self.segs_left = (3 * self.seglen) >> 1;
-        }
-
-        if self.dope_ptrs.0 > self.dope_ptrs.1 {
+        // questionable safety... is it possible that a segment starts at last_el plus 1?
+        if self.seg_ptrs.0 == self.last_element_plus_one && self.dope_ptrs.0 == self.dope_ptrs.1 {
             return None;
         }
 
         if self.seg_ptrs.0 > self.seg_ptrs.1 {
-            self.dope_ptrs.0 = unsafe { self.dope_ptrs.0.add(1) };
-        }
-
-        self.seg_ptrs.0 = unsafe { self.seg_ptrs.0.add(1) };
-        self.segs_left -= 1;
-        todo!()
-    }
-}
-
-pub struct IterT<'a, T: 'a> {
-    dope_iter: core::iter::Copied<core::slice::Iter<'a, NonNull<T>>>,
-    seg_iter: core::slice::Iter<'a, T>,
-    end_seg_ptr: NonNull<T>,
-    end_seg_len: u32,
-    /// number of segments left of length seglen
-    segs_left: u32,
-    seglen: u32,
-    marker: PhantomData<&'a T>,
-}
-
-impl<'a, T> Debug for IterT<'a, T> {
-    fn fmt(&self, f: &mut Formatter) -> core::fmt::Result {
-        write!(f, "seglen: {}, segs_left: {}", self.seglen, self.segs_left)
-    }
-}
-
-impl<'a, T> Iterator for IterT<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(item) = self.seg_iter.next() {
-            Some(item)
-        } else {
-            if let Some(ptr) = self.dope_iter.next() {
-                if self.segs_left == 0 {
-                    self.seglen <<= 1;
-                    self.segs_left = (3 * self.seglen) >> 1; // self.seglen will only ever be >= 4 at this point 👍
-                }
-
-                if ptr == self.end_seg_ptr {
-                    self.seg_iter = unsafe {
-                        core::slice::from_raw_parts(
-                            ptr.as_ptr() as *const T,
-                            self.end_seg_len as usize,
-                        )
-                    }
-                    .iter();
-                } else {
-                    self.seg_iter = unsafe {
-                        core::slice::from_raw_parts(ptr.as_ptr() as *const T, self.seglen as usize)
-                    }
-                    .iter();
-                }
-
-                self.segs_left -= 1;
-                self.seg_iter.next()
-            } else {
-                None
+            self.segs_left -= 1;
+            if self.segs_left == 0 {
+                self.seglen <<= 1;
+                self.segs_left = (3 * self.seglen) >> 2;
             }
+            self.dope_ptrs.0 = unsafe { self.dope_ptrs.0.add(1) };
+            let elem_ptr = unsafe { self.dope_ptrs.0.read() };
+            self.seg_ptrs = unsafe { (elem_ptr, elem_ptr.add(self.seglen as usize - 1)) };
         }
+
+        let out = unsafe { self.seg_ptrs.0.as_ref() };
+        self.seg_ptrs.0 = unsafe { self.seg_ptrs.0.add(1) };
+        Some(out)
     }
 }
 
@@ -380,7 +298,7 @@ impl<T> Drop for SqVec<T> {
         let mut ix1 = 0_usize;
         let max_lsl = u32::ilog2((self.dope_cap + 2) / 3) + 1;
         for lsl in 1..=max_lsl {
-            let ix2 = Self::last_seg(lsl).min(self.alloc_seg_count.saturating_sub(1)) as usize;
+            let ix2 = Self::last_seg(lsl).min(self.alloc_seg_count - 1) as usize;
             let layout = Layout::array::<T>(1 << lsl).unwrap();
             for &ptr in dope_slice[ix1..=ix2].iter() {
                 unsafe { dealloc(ptr.as_ptr() as *mut u8, layout) };
@@ -395,48 +313,6 @@ impl<T> Drop for SqVec<T> {
             )
         };
     }
-}
-
-pub struct IterMut<'a, T> {
-    data: &'a SqVec<T>,
-    ix: u32,
-}
-
-impl<'a, T> Iterator for IterMut<'a, T> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ix == self.data.len() as u32 {
-            return None;
-        }
-        let out = unsafe { self.data.item_ptr(self.ix).as_mut() };
-        self.ix += 1;
-        return Some(out);
-    }
-}
-
-pub struct Iter<'a, T> {
-    data: &'a SqVec<T>,
-    ix: u32,
-}
-
-impl<'a, T> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ix == self.data.len() as u32 {
-            return None;
-        }
-        let out = unsafe { self.data.item_ptr(self.ix).as_ref() };
-        self.ix += 1;
-        return Some(out);
-    }
-}
-
-pub struct TIter<'a, T> {
-    seg_ptr: NonNull<T>,
-    seg_ix: u32,
-    marker: PhantomData<&'a SqVec<T>>,
 }
 
 impl<T> Index<u32> for SqVec<T> {
@@ -491,7 +367,7 @@ impl<T: PartialEq> PartialEq<SqVec<T>> for Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::SqVec;
-    use rand::{Rng, random, rng, thread_rng};
+    use rand::{Rng, random, rng};
 
     #[test]
     fn single_box_drop() {
@@ -519,15 +395,15 @@ mod tests {
     #[test]
     /// randomised test of mutating api
     fn fuzz() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut vec = Vec::<Box<u32>>::new();
         let mut sqvec = SqVec::<Box<u32>>::new();
         for _ in 0u32..2048 {
-            let choice: u8 = rng.gen_range(0..=4);
+            let choice: u8 = rng.random_range(0..=4);
             match choice {
                 0 => {
                     if !vec.is_empty() {
-                        let ix = rng.gen_range(0..vec.len());
+                        let ix = rng.random_range(0..vec.len());
                         assert_eq!(vec[ix], sqvec[ix as u32], "Not equal at index: {ix}");
                     }
                 }
@@ -555,16 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn a_titer() {
+    fn drop_n() {
         let mut sqvec = SqVec::<u32>::new();
-        for i in 0..2 {
+        for i in 0..32 {
             sqvec.push(i);
-        }
-        let mut si = sqvec.iter_t();
-        println!("{:#?}", &si);
-        for _ in 0..2 {
-            si.next();
-            println!("{:#?}", &si);
         }
     }
 
@@ -579,12 +449,11 @@ mod tests {
             vec.push(a);
         }
         let mut sqiter = sqvec.iter();
-        let mut sqiter2 = sqvec.iter_t();
         let mut viter = vec.iter();
-        for i in 0u32..2048 {
-            // assert_eq!(sqiter.next(), viter.next(), "{i}");
-            assert_eq!(sqiter.next(), sqiter2.next(), "{i}");
+        while let (Some(a), Some(b)) = (viter.next(), sqiter.next()) {
+            assert_eq!(a, b);
         }
+        assert_eq!(sqiter.next(), None);
     }
 
     #[test]

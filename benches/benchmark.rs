@@ -1,4 +1,5 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use rand::{Rng, rng};
 use sqvec::SqVec;
 
 fn push_benchmark_sqvec(c: &mut Criterion) {
@@ -15,37 +16,36 @@ fn push_benchmark_sqvec(c: &mut Criterion) {
 }
 
 fn sqvec_iter_bench1(c: &mut Criterion) {
+    let mut rng = rng();
     let mut sqvec = SqVec::<u32>::new();
-    for i in 0..(1 << 23) {
-        sqvec.push(i);
+    for _ in 0..(1 << 16) {
+        sqvec.push(black_box(rng.random()));
     }
 
-    c.bench_function("iter 1", |c| {
+    c.bench_function("iter sqvec", |c| {
         c.iter(|| {
-            sqvec.iter().for_each(|x| {
+            sqvec.iter_t2().for_each(|x| {
                 black_box(x);
             });
         });
     });
 }
 
-fn push_benchmark_vec(c: &mut Criterion) {
-    // let mut rng = rng();
+fn iter_benchmark_vec(c: &mut Criterion) {
+    let mut rng = rng();
+    let mut vec = Vec::<u32>::new();
+    for _ in 0..(1 << 16) {
+        vec.push(black_box(rng.random()));
+    }
 
-    c.bench_function("vec push", |c| {
+    c.bench_function("iter vec", |c| {
         c.iter(|| {
-            let mut vec = Vec::<u32>::new();
-            for i in 0..(1 << 23) {
-                vec.push(i);
-            }
+            vec.iter().for_each(|x| {
+                black_box(x);
+            });
         });
     });
 }
 
-criterion_group!(
-    benches,
-    push_benchmark_sqvec,
-    push_benchmark_vec,
-    sqvec_iter_bench1
-);
+criterion_group!(benches, sqvec_iter_bench1, iter_benchmark_vec);
 criterion_main!(benches);
