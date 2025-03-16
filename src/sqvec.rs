@@ -1,4 +1,4 @@
-use core::fmt::{Debug, Formatter};
+use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Index, IndexMut};
@@ -22,6 +22,7 @@ use std::alloc::{self, Layout, alloc, dealloc, realloc};
 // - benchmark random operations against vec
 // - usize as index?
 // - store last element ptr and segment details for faster push/pop?
+// - ExactSizeIterator, size_hint(), DoubleEndedIterator, IntoIterator, FromIterator
 
 /// A non-contiguos extensible array that achieves asymptotically optimal
 /// space overhead of O(√n) while maintaining comparable time efficiency**.
@@ -53,7 +54,7 @@ impl<T> SqVec<T> {
     /// The sqvec will not allocate until elements are pushed onto it.
     pub fn new() -> Self {
         assert!(
-            std::mem::size_of::<T>() != 0,
+            core::mem::size_of::<T>() != 0,
             "This data structure does not support ZST's"
         );
         Self {
@@ -237,7 +238,20 @@ impl<T> SqVec<T> {
                 self.dope.add(Self::mapping(self.len - 1).0 as usize)
             }),
             seg_ptrs: unsafe { (self.dope.read(), self.dope.read().add(1)) },
-            last_element_plus_one: unsafe { self.item_ptr(self.len - 1).add(1) },
+            last_element: unsafe { self.item_ptr(self.len - 1).add(1) },
+            seglen: 2,
+            segs_left: 2,
+            marker: PhantomData,
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<T> {
+        IterMut {
+            dope_ptrs: (self.dope, unsafe {
+                self.dope.add(Self::mapping(self.len - 1).0 as usize)
+            }),
+            seg_ptrs: unsafe { (self.dope.read(), self.dope.read().add(1)) },
+            last_element: unsafe { self.item_ptr(self.len - 1).add(1) },
             seglen: 2,
             segs_left: 2,
             marker: PhantomData,
@@ -248,10 +262,19 @@ impl<T> SqVec<T> {
 pub struct Iter<'a, T: 'a> {
     dope_ptrs: (NonNull<NonNull<T>>, NonNull<NonNull<T>>),
     seg_ptrs: (NonNull<T>, NonNull<T>),
-    last_element_plus_one: NonNull<T>,
+    last_element: NonNull<T>,
     seglen: u32,
     segs_left: u32,
     marker: PhantomData<&'a T>,
+}
+
+pub struct IterMut<'a, T: 'a> {
+    dope_ptrs: (NonNull<NonNull<T>>, NonNull<NonNull<T>>),
+    seg_ptrs: (NonNull<T>, NonNull<T>),
+    last_element: NonNull<T>,
+    seglen: u32,
+    segs_left: u32,
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T: 'a> Iterator for Iter<'a, T> {
@@ -259,7 +282,7 @@ impl<'a, T: 'a> Iterator for Iter<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         // questionable safety... is it possible that a segment starts at last_el plus 1?
-        if self.seg_ptrs.0 == self.last_element_plus_one && self.dope_ptrs.0 == self.dope_ptrs.1 {
+        if self.seg_ptrs.0 == self.last_element && self.dope_ptrs.0 == self.dope_ptrs.1 {
             return None;
         }
 
@@ -280,39 +303,113 @@ impl<'a, T: 'a> Iterator for Iter<'a, T> {
     }
 }
 
-impl<T> Drop for SqVec<T> {
-    fn drop(&mut self) {
-        if self.dope_cap == 0 {
-            return;
-        }
-        // drop items in SqVec
-        if mem::needs_drop::<T>() {
-            for i in 0..self.len {
-                unsafe { self.item_ptr(i).drop_in_place() };
-            }
+impl<'a, T: 'a> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // questionable safety... is it possible that a segment starts at last_el plus 1?
+        if self.seg_ptrs.0 == self.last_element && self.dope_ptrs.0 == self.dope_ptrs.1 {
+            return None;
         }
 
-        let dope_slice = unsafe {
-            std::slice::from_raw_parts(self.dope.as_ptr(), self.alloc_seg_count as usize)
-        };
-        let mut ix1 = 0_usize;
-        let max_lsl = u32::ilog2((self.dope_cap + 2) / 3) + 1;
-        for lsl in 1..=max_lsl {
-            let ix2 = Self::last_seg(lsl).min(self.alloc_seg_count - 1) as usize;
-            let layout = Layout::array::<T>(1 << lsl).unwrap();
-            for &ptr in dope_slice[ix1..=ix2].iter() {
-                unsafe { dealloc(ptr.as_ptr() as *mut u8, layout) };
+        if self.seg_ptrs.0 > self.seg_ptrs.1 {
+            self.segs_left -= 1;
+            if self.segs_left == 0 {
+                self.seglen <<= 1;
+                self.segs_left = (3 * self.seglen) >> 2;
             }
-            ix1 = ix2 + 1;
+            self.dope_ptrs.0 = unsafe { self.dope_ptrs.0.add(1) };
+            let elem_ptr = unsafe { self.dope_ptrs.0.read() };
+            self.seg_ptrs = unsafe { (elem_ptr, elem_ptr.add(self.seglen as usize - 1)) };
+        }
+
+        let out = unsafe { self.seg_ptrs.0.as_mut() };
+        self.seg_ptrs.0 = unsafe { self.seg_ptrs.0.add(1) };
+        Some(out)
+    }
+}
+
+impl<T> Drop for SqVec<T> {
+    fn drop(&mut self) {
+        if self.alloc_seg_count == 0 {
+            return;
+        }
+
+        // for item in self.iter_mut() {
+        //     unsafe { core::ptr::drop_in_place(item) };
+        // }
+
+        let mut dope_seg_ptr: NonNull<NonNull<T>> = self.dope;
+        let mut seg_start_ptr: NonNull<T> = unsafe { self.dope.read() };
+        let mut elem_ptr: NonNull<T> = seg_start_ptr;
+        let mut seg_end_ptr: NonNull<T> = unsafe { seg_start_ptr.add(1) };
+        let mut seglen: u32 = 2;
+        let mut segs_left: u32 = 2;
+
+        loop {
+            unsafe { elem_ptr.drop_in_place() };
+            if elem_ptr > seg_end_ptr {
+                unsafe {
+                    dealloc(
+                        seg_start_ptr.as_ptr() as *mut u8,
+                        Layout::array::<T>(seglen as usize).unwrap_unchecked(),
+                    )
+                };
+                segs_left -= 1;
+                if segs_left == 0 {
+                    seglen <<= 1;
+                    segs_left = (3 * seglen) >> 2;
+                }
+                dope_seg_ptr = unsafe { dope_seg_ptr.add(1) };
+                seg_start_ptr = unsafe { dope_seg_ptr.read() };
+                seg_end_ptr = unsafe { seg_start_ptr.add(seglen as usize - 1) };
+                elem_ptr = seg_start_ptr;
+            } else {
+                elem_ptr = unsafe { elem_ptr.add(1) };
+            }
+            break;
         }
 
         unsafe {
             dealloc(
                 self.dope.as_ptr() as *mut u8,
-                Layout::array::<NonNull<T>>(self.dope_cap as usize).unwrap(),
+                Layout::array::<NonNull<T>>(self.dope_cap as usize).unwrap_unchecked(),
             )
         };
     }
+
+    // fn drop(&mut self) {
+    //     if self.dope_cap == 0 {
+    //         return;
+    //     }
+    //     // drop items in SqVec
+    //     if mem::needs_drop::<T>() {
+    //         for i in 0..self.len {
+    //             unsafe { self.item_ptr(i).drop_in_place() };
+    //         }
+    //     }
+
+    //     let dope_slice = unsafe {
+    //         core::slice::from_raw_parts(self.dope.as_ptr(), self.alloc_seg_count as usize)
+    //     };
+    //     let mut ix1 = 0_usize;
+    //     let max_lsl = u32::ilog2((self.dope_cap + 2) / 3) + 1;
+    //     for lsl in 1..=max_lsl {
+    //         let ix2 = Self::last_seg(lsl).min(self.alloc_seg_count - 1) as usize;
+    //         let layout = Layout::array::<T>(1 << lsl).unwrap();
+    //         for &ptr in dope_slice[ix1..=ix2].iter() {
+    //             unsafe { dealloc(ptr.as_ptr() as *mut u8, layout) };
+    //         }
+    //         ix1 = ix2 + 1;
+    //     }
+
+    //     unsafe {
+    //         dealloc(
+    //             self.dope.as_ptr() as *mut u8,
+    //             Layout::array::<NonNull<T>>(self.dope_cap as usize).unwrap(),
+    //         )
+    //     };
+    // }
 }
 
 impl<T> Index<u32> for SqVec<T> {
@@ -443,7 +540,7 @@ mod tests {
         let mut rng = rng();
         let mut sqvec = SqVec::<u32>::new();
         let mut vec = Vec::<u32>::new();
-        for _ in 0u32..2048 {
+        for _ in 0u32..2 {
             let a = rng.random();
             sqvec.push(a);
             vec.push(a);

@@ -24,7 +24,7 @@ fn sqvec_iter_bench1(c: &mut Criterion) {
 
     c.bench_function("iter sqvec", |c| {
         c.iter(|| {
-            sqvec.iter_t2().for_each(|x| {
+            sqvec.iter().for_each(|x| {
                 black_box(x);
             });
         });
