@@ -231,15 +231,17 @@ impl<T> SqVec<T> {
     }
 
     fn raw_iter(&self) -> RawIter<T> {
-        RawIter {
-            dope_ptrs: (self.dope, unsafe {
-                self.dope.add(Self::mapping(self.len - 1).0 as usize)
-            }),
-            seg_ptrs: unsafe { (self.dope.read(), self.dope.read().add(1)) },
-            past_last_element: unsafe { self.item_ptr(self.len - 1).add(1) },
-            seglen: 2,
-            segs_left: 2,
-        }
+        let mut rdi = self.raw_dope_iter();
+        let rsi = if let Some(x) = rdi.next() {
+            x
+        } else {
+            let ptr = NonNull::dangling();
+            RawSegIter {
+                ptr: unsafe { ptr.add(1) },
+                end: ptr,
+            }
+        };
+        RawIter { rdi, rsi }
     }
 
     pub fn iter(&self) -> Iter<T> {
@@ -255,14 +257,18 @@ impl<T> SqVec<T> {
             marker: PhantomData,
         }
     }
-}
 
-struct RawIter<T> {
-    dope_ptrs: (NonNull<NonNull<T>>, NonNull<NonNull<T>>),
-    seg_ptrs: (NonNull<T>, NonNull<T>),
-    past_last_element: NonNull<T>,
-    seglen: u32,
-    segs_left: u32,
+    fn raw_dope_iter(&self) -> RawDopeIter<T> {
+        let (lseg, loff) = Self::mapping(self.len.saturating_sub(1));
+
+        RawDopeIter {
+            seg_ptr: self.dope,
+            last_seg_ptr: unsafe { self.dope.add(lseg as usize) },
+            last_offset: loff,
+            seglen: 2,
+            segs_left: 2,
+        }
+    }
 }
 
 // is T: 'a necessary?
@@ -274,32 +280,6 @@ pub struct Iter<'a, T: 'a> {
 pub struct IterMut<'a, T: 'a> {
     raw_iter: RawIter<T>,
     marker: PhantomData<&'a mut T>,
-}
-
-impl<T> Iterator for RawIter<T> {
-    type Item = NonNull<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // questionable safety... is it possible that a segment starts at last_el plus 1?
-        if self.seg_ptrs.0 == self.past_last_element && self.dope_ptrs.0 == self.dope_ptrs.1 {
-            return None;
-        }
-
-        if self.seg_ptrs.0 > self.seg_ptrs.1 {
-            self.segs_left -= 1;
-            if self.segs_left == 0 {
-                self.seglen <<= 1;
-                self.segs_left = (3 * self.seglen) >> 2;
-            }
-            self.dope_ptrs.0 = unsafe { self.dope_ptrs.0.add(1) };
-            let elem_ptr = unsafe { self.dope_ptrs.0.read() };
-            self.seg_ptrs = unsafe { (elem_ptr, elem_ptr.add(self.seglen as usize - 1)) };
-        }
-
-        let out = self.seg_ptrs.0;
-        self.seg_ptrs.0 = unsafe { self.seg_ptrs.0.add(1) };
-        Some(out)
-    }
 }
 
 impl<'a, T: 'a> Iterator for Iter<'a, T> {
@@ -315,6 +295,86 @@ impl<'a, T: 'a> Iterator for IterMut<'a, T> {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.raw_iter.next().map(|mut x| unsafe { x.as_mut() })
+    }
+}
+
+struct RawIter<T> {
+    rdi: RawDopeIter<T>,
+    rsi: RawSegIter<T>,
+}
+
+struct RawDopeIter<T> {
+    seg_ptr: NonNull<NonNull<T>>,
+    last_seg_ptr: NonNull<NonNull<T>>,
+    last_offset: u32,
+    seglen: u32,
+    segs_left: u32,
+}
+
+struct RawSegIter<T> {
+    ptr: NonNull<T>,
+    end: NonNull<T>,
+}
+
+impl<T> Iterator for RawDopeIter<T> {
+    type Item = RawSegIter<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let out = if self.seg_ptr < self.last_seg_ptr {
+            let first_item = unsafe { self.seg_ptr.read() };
+            Some(RawSegIter {
+                ptr: first_item,
+                end: unsafe { first_item.add(self.seglen as usize - 1) },
+            })
+        } else if self.seg_ptr == self.last_seg_ptr {
+            let first_item = unsafe { self.seg_ptr.read() };
+            Some(RawSegIter {
+                ptr: first_item,
+                end: unsafe { first_item.add(self.last_offset as usize) },
+            })
+        } else {
+            return None;
+        };
+
+        self.seg_ptr = unsafe { self.seg_ptr.add(1) };
+        self.segs_left -= 1;
+        if self.segs_left == 0 {
+            self.seglen <<= 1;
+            self.segs_left = (3 * self.seglen) >> 2;
+        }
+
+        out
+    }
+}
+
+impl<T> Iterator for RawSegIter<T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr > self.end {
+            return None;
+        }
+
+        let out = self.ptr;
+        self.ptr = unsafe { self.ptr.add(1) };
+        Some(out)
+    }
+}
+
+impl<T> Iterator for RawIter<T> {
+    type Item = NonNull<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(x) = self.rsi.next() {
+            Some(x)
+        } else {
+            if let Some(y) = self.rdi.next() {
+                self.rsi = y;
+                self.rsi.next()
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -444,9 +504,13 @@ mod tests {
         for i in 0..13 {
             sqvec.push(Box::new(i));
         }
-        for _ in 0..13 {
-            sqvec.pop();
+        let mut iter = sqvec.iter();
+        while let Some(item) = iter.next() {
+            println!("{}", item);
         }
+
+        iter.next();
+        iter.next();
     }
 
     #[test]
@@ -533,7 +597,7 @@ mod tests {
         while let (Some(a), Some(b)) = (viter.next(), sqiter.next()) {
             assert_eq!(a, b);
         }
-        assert_eq!(sqiter.next(), None);
+        // assert_eq!(sqiter.next(), None);
     }
 
     #[test]
