@@ -230,6 +230,27 @@ impl<T> SqVec<T> {
         }
     }
 
+    fn raw_dope_iter(&self) -> RawDopeIter<T> {
+        let (lseg, loff) = Self::mapping(self.len.saturating_sub(1));
+        let last_seg_ptr = unsafe { self.dope.add(lseg as usize) };
+        // self.dope.add(1)
+        RawDopeIter {
+            seg_ptr: if self.len == 0 {
+                unsafe {
+                    NonNull::new_unchecked(core::ptr::without_provenance_mut(
+                        self.dope.addr().get() + 1,
+                    ))
+                }
+            } else {
+                self.dope
+            },
+            last_seg_ptr,
+            last_offset: loff,
+            seglen: 2,
+            segs_left: 2,
+        }
+    }
+
     fn raw_iter(&self) -> RawIter<T> {
         let mut rdi = self.raw_dope_iter();
         let rsi = if let Some(x) = rdi.next() {
@@ -237,7 +258,9 @@ impl<T> SqVec<T> {
         } else {
             let ptr = NonNull::dangling();
             RawSegIter {
-                ptr: unsafe { ptr.add(1) },
+                ptr: unsafe {
+                    NonNull::new_unchecked(core::ptr::without_provenance_mut(ptr.addr().get() + 1))
+                },
                 end: ptr,
             }
         };
@@ -257,50 +280,6 @@ impl<T> SqVec<T> {
             marker: PhantomData,
         }
     }
-
-    fn raw_dope_iter(&self) -> RawDopeIter<T> {
-        let (lseg, loff) = Self::mapping(self.len.saturating_sub(1));
-
-        RawDopeIter {
-            seg_ptr: self.dope,
-            last_seg_ptr: unsafe { self.dope.add(lseg as usize) },
-            last_offset: loff,
-            seglen: 2,
-            segs_left: 2,
-        }
-    }
-}
-
-// is T: 'a necessary?
-pub struct Iter<'a, T: 'a> {
-    raw_iter: RawIter<T>,
-    marker: PhantomData<&'a T>,
-}
-
-pub struct IterMut<'a, T: 'a> {
-    raw_iter: RawIter<T>,
-    marker: PhantomData<&'a mut T>,
-}
-
-impl<'a, T: 'a> Iterator for Iter<'a, T> {
-    type Item = &'a T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.raw_iter.next().map(|x| unsafe { x.as_ref() })
-    }
-}
-
-impl<'a, T: 'a> Iterator for IterMut<'a, T> {
-    type Item = &'a mut T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.raw_iter.next().map(|mut x| unsafe { x.as_mut() })
-    }
-}
-
-struct RawIter<T> {
-    rdi: RawDopeIter<T>,
-    rsi: RawSegIter<T>,
 }
 
 struct RawDopeIter<T> {
@@ -314,6 +293,22 @@ struct RawDopeIter<T> {
 struct RawSegIter<T> {
     ptr: NonNull<T>,
     end: NonNull<T>,
+}
+
+struct RawIter<T> {
+    rdi: RawDopeIter<T>,
+    rsi: RawSegIter<T>,
+}
+
+// is T: 'a necessary?
+pub struct Iter<'a, T: 'a> {
+    raw_iter: RawIter<T>,
+    marker: PhantomData<&'a T>,
+}
+
+pub struct IterMut<'a, T: 'a> {
+    raw_iter: RawIter<T>,
+    marker: PhantomData<&'a mut T>,
 }
 
 impl<T> Iterator for RawDopeIter<T> {
@@ -375,6 +370,22 @@ impl<T> Iterator for RawIter<T> {
                 None
             }
         }
+    }
+}
+
+impl<'a, T: 'a> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw_iter.next().map(|x| unsafe { x.as_ref() })
+    }
+}
+
+impl<'a, T: 'a> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw_iter.next().map(|mut x| unsafe { x.as_mut() })
     }
 }
 
@@ -518,6 +529,7 @@ mod tests {
         let mut sqvec = SqVec::<Box<u32>>::new();
         sqvec.push(Box::new(32));
         sqvec.pop();
+        assert_eq!(sqvec.iter().next(), None);
     }
 
     #[test]
@@ -534,6 +546,7 @@ mod tests {
     #[test]
     fn drop_empty() {
         let _sqvec = SqVec::<Box<u32>>::new();
+        assert_eq!(_sqvec.iter().next(), None);
     }
 
     #[test]
@@ -587,7 +600,7 @@ mod tests {
         let mut rng = rng();
         let mut sqvec = SqVec::<u32>::new();
         let mut vec = Vec::<u32>::new();
-        for _ in 0u32..2 {
+        for _ in 0u32..600 {
             let a = rng.random();
             sqvec.push(a);
             vec.push(a);
@@ -619,5 +632,33 @@ mod tests {
         assert_ne!(sqvec!(3, 5, 2), sqvec!(2, 3));
         assert_ne!(sqvec!(33, 1, 34, 1), vec![23, 3, 5]);
         assert_ne!(sqvec!(2, 3, 6), sqvec!(2, 3, 6, 5));
+    }
+
+    #[test]
+    fn iter_mut() {
+        let mut rng = rng();
+        let mut sqvec = SqVec::<u32>::new();
+        let mut vec = Vec::<u32>::new();
+        for _ in 0u32..600 {
+            let r: u32 = rng.random();
+            sqvec.push(r);
+            vec.push(r);
+        }
+
+        {
+            let mut sqiter_mut = sqvec.iter_mut();
+            let mut viter_mut = vec.iter_mut();
+            while let (Some(a), Some(b)) = (viter_mut.next(), sqiter_mut.next()) {
+                let r: u32 = rng.random();
+                *a /= r;
+                *b /= r
+            }
+        }
+
+        let mut sqiter = sqvec.iter();
+        let mut viter = vec.iter();
+        while let (Some(a), Some(b)) = (viter.next(), sqiter.next()) {
+            assert_eq!(a, b);
+        }
     }
 }
