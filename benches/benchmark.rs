@@ -18,7 +18,7 @@ fn push_benchmark_sqvec(c: &mut Criterion) {
 fn sqvec_iter_bench1(c: &mut Criterion) {
     let mut rng = rng();
     let mut sqvec = SqVec::<u32>::new();
-    for _ in 0..(1 << 16) {
+    for _ in 0..(1 << 21) {
         sqvec.push(black_box(rng.random()));
     }
 
@@ -34,7 +34,7 @@ fn sqvec_iter_bench1(c: &mut Criterion) {
 fn iter_benchmark_vec(c: &mut Criterion) {
     let mut rng = rng();
     let mut vec = Vec::<u32>::new();
-    for _ in 0..(1 << 16) {
+    for _ in 0..(1 << 21) {
         vec.push(black_box(rng.random()));
     }
 

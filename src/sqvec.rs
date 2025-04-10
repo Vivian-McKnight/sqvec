@@ -4,6 +4,7 @@ use core::mem;
 use core::ops::{Index, IndexMut};
 use core::ptr::NonNull;
 use std::alloc::{self, Layout, alloc, dealloc, realloc};
+use std::iter::FusedIterator;
 
 // todo
 // - store seglen instead of log_seglen?
@@ -77,7 +78,7 @@ impl<T> SqVec<T> {
                 Layout::array::<NonNull<T>>(2).unwrap_unchecked()
             })
         } else {
-            let new_cap = self.dope_cap + Self::segs_of_len(Self::lsln(self.len - 1));
+            let new_cap = self.dope_cap + Self::segs_of_len(Self::lsln(self.len.saturating_sub(1)));
             let new_layout =
                 Layout::array::<NonNull<T>>(new_cap as usize).expect("Allocation too large");
             (new_cap, new_layout)
@@ -100,13 +101,23 @@ impl<T> SqVec<T> {
 
     /// Allocates a new segment of length `1 << self.log_seglen` at index `self.alloc_seg_count` in dope.
     fn alloc_seg(&mut self) {
-        let layout = Layout::array::<T>(1 << Self::lsln(self.len)).expect("Allocation too large");
+        // debug_assert_eq!(1 << Self::lsln(self.len), Self::lslnv(self.len));
+        let layout =
+            Layout::array::<T>(Self::lsln(self.len) as usize).expect("Allocation too large");
         let handle = unsafe { alloc(layout) };
         let ptr =
             NonNull::new(handle as *mut T).unwrap_or_else(|| alloc::handle_alloc_error(layout));
         unsafe { self.dope.add(self.alloc_seg_count as usize).write(ptr) };
         self.alloc_seg_count += 1;
     }
+
+    // fn lslnv(v: u32) -> u32 {
+    //     if v == 0 {
+    //         2
+    //     } else {
+    //         v.next_power_of_two()
+    //     }
+    // }
 
     /// Adds `val` to the end of the SqVec, increasing its length by 1.
     pub fn push(&mut self, val: T) {
@@ -129,6 +140,38 @@ impl<T> SqVec<T> {
         } else {
             self.len -= 1;
             Some(unsafe { self.item_ptr(self.len).read() })
+        }
+    }
+
+    pub fn first(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(unsafe { self.dope.read().as_ref() })
+        }
+    }
+
+    pub fn first_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(unsafe { self.dope.read().as_mut() })
+        }
+    }
+
+    pub fn last(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(unsafe { self.item_ptr(self.len - 1).as_ref() })
+        }
+    }
+
+    pub fn last_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(unsafe { self.item_ptr(self.len - 1).as_mut() })
         }
     }
 
@@ -180,31 +223,22 @@ impl<T> SqVec<T> {
         (segnum, offset)
     }
 
-    /// Gives the dope index of the first segment of length (1 << log_seglen)
+    /// Gives the dope index of the first segment of length seg_len
     #[inline]
-    fn first_seg(log_seglen: u32) -> u32 {
-        if log_seglen == 1 {
-            0
-        } else {
-            3 * (1 << (log_seglen - 2)) - 1
-        }
+    fn first_seg(seg_len: u32) -> u32 {
+        (3 * seg_len >> 2) - 1
     }
 
-    /// Gives the dope index of the last segment of length (1 << log_seglen)
+    /// Returns the dope index of the last segment of length `seg_len`. `seg_len` must be a power of 2
     #[inline]
-    fn last_seg(log_seglen: u32) -> u32 {
-        3 * (1 << (log_seglen - 1)) - 2
+    fn last_seg(seg_len: u32) -> u32 {
+        (3 * seg_len >> 1) - 2
     }
 
-    /// Returns the max number of segments of lenght (1 << log_seglen) that can
-    /// be allocated
+    /// Returns the max number of segments of length `seg_len`. `seg_len` must be a power of 2
     #[inline]
-    fn segs_of_len(log_seglen: u32) -> u32 {
-        if log_seglen == 1 {
-            2
-        } else {
-            3 * (1 << (log_seglen - 2))
-        }
+    fn segs_of_len(seg_len: u32) -> u32 {
+        if seg_len == 2 { 2 } else { 3 * seg_len >> 2 }
     }
 
     /// Returns the pointer to the item in the SqVec at index `ix` (Does not check if ix is < self.len)
@@ -219,21 +253,18 @@ impl<T> SqVec<T> {
         unsafe { self.dope.add(segnum as usize).read().add(offset as usize) }
     }
 
-    /// calculates the log base 2 segment length of the
-    /// segment that the element at index `v` would be located
+    /// Returns the segment length of the segment that would contain item of index `v`
     #[inline]
     fn lsln(v: u32) -> u32 {
         if v == 0 {
-            1
+            2
         } else {
-            (32 - v.leading_zeros()).div_ceil(2)
+            1 << ((32 - v.leading_zeros()).div_ceil(2))
         }
     }
 
     fn raw_dope_iter(&self) -> RawDopeIter<T> {
         let (lseg, loff) = Self::mapping(self.len.saturating_sub(1));
-        let last_seg_ptr = unsafe { self.dope.add(lseg as usize) };
-        // self.dope.add(1)
         RawDopeIter {
             seg_ptr: if self.len == 0 {
                 unsafe {
@@ -244,29 +275,32 @@ impl<T> SqVec<T> {
             } else {
                 self.dope
             },
-            last_seg_ptr,
+            last_seg_ptr: unsafe { self.dope.add(lseg as usize) },
             last_offset: loff,
-            seglen: 2,
+            seg_len: 2,
             segs_left: 2,
         }
     }
 
     fn raw_iter(&self) -> RawIter<T> {
-        let mut rdi = self.raw_dope_iter();
-        let rsi = if let Some(x) = rdi.next() {
-            x
-        } else {
-            let ptr = NonNull::dangling();
-            RawSegIter {
-                ptr: unsafe {
-                    NonNull::new_unchecked(core::ptr::without_provenance_mut(ptr.addr().get() + 1))
-                },
-                end: ptr,
-            }
-        };
-        RawIter { rdi, rsi }
+        RawIter {
+            rdi: self.raw_dope_iter(),
+            rsi: {
+                let ptr = NonNull::dangling();
+                RawSegIter {
+                    ptr: unsafe {
+                        NonNull::new_unchecked(core::ptr::without_provenance_mut(
+                            ptr.addr().get() + 1,
+                        ))
+                    },
+                    end: ptr,
+                }
+            },
+        }
     }
 
+    /// Returns an iterator that returns immutable (shared) references to the
+    /// SqVec's items in ascending order from 0..self.len
     pub fn iter(&self) -> Iter<T> {
         Iter {
             raw_iter: self.raw_iter(),
@@ -274,6 +308,8 @@ impl<T> SqVec<T> {
         }
     }
 
+    /// Returns an iterator that returns mutable references to the
+    /// SqVec's items in ascending order from 0..self.len
     pub fn iter_mut(&mut self) -> IterMut<T> {
         IterMut {
             raw_iter: self.raw_iter(),
@@ -286,7 +322,7 @@ struct RawDopeIter<T> {
     seg_ptr: NonNull<NonNull<T>>,
     last_seg_ptr: NonNull<NonNull<T>>,
     last_offset: u32,
-    seglen: u32,
+    seg_len: u32,
     segs_left: u32,
 }
 
@@ -319,7 +355,7 @@ impl<T> Iterator for RawDopeIter<T> {
             let first_item = unsafe { self.seg_ptr.read() };
             Some(RawSegIter {
                 ptr: first_item,
-                end: unsafe { first_item.add(self.seglen as usize - 1) },
+                end: unsafe { first_item.add(self.seg_len as usize - 1) },
             })
         } else if self.seg_ptr == self.last_seg_ptr {
             let first_item = unsafe { self.seg_ptr.read() };
@@ -331,13 +367,13 @@ impl<T> Iterator for RawDopeIter<T> {
             return None;
         };
 
-        self.seg_ptr = unsafe { self.seg_ptr.add(1) };
         self.segs_left -= 1;
         if self.segs_left == 0 {
-            self.seglen <<= 1;
-            self.segs_left = (3 * self.seglen) >> 2;
+            self.seg_len <<= 1;
+            self.segs_left = 3 * self.seg_len >> 2;
         }
 
+        self.seg_ptr = unsafe { self.seg_ptr.add(1) };
         out
     }
 }
@@ -389,6 +425,12 @@ impl<'a, T: 'a> Iterator for IterMut<'a, T> {
     }
 }
 
+impl<T> FusedIterator for RawDopeIter<T> {}
+impl<T> FusedIterator for RawSegIter<T> {}
+impl<T> FusedIterator for RawIter<T> {}
+impl<T> FusedIterator for Iter<'_, T> {}
+impl<T> FusedIterator for IterMut<'_, T> {}
+
 // Control flow could use some work, maybe iterators
 impl<T> Drop for SqVec<T> {
     fn drop(&mut self) {
@@ -396,7 +438,7 @@ impl<T> Drop for SqVec<T> {
             return;
         }
 
-        let mut seglen: u32 = 2;
+        let mut seg_len: u32 = 2;
         let mut segs_left: u32 = 2;
 
         // seg level pointers (NonNull<NonNull<T>>)
@@ -420,7 +462,7 @@ impl<T> Drop for SqVec<T> {
         while cur_seg <= last_seg {
             if cur_seg < last_nonempty_seg {
                 let mut cur_item = unsafe { cur_seg.read() };
-                let last_item = unsafe { cur_item.add(seglen as usize - 1) };
+                let last_item = unsafe { cur_item.add(seg_len as usize - 1) };
                 while cur_item <= last_item {
                     unsafe { cur_item.drop_in_place() };
                     cur_item = unsafe { cur_item.add(1) };
@@ -430,14 +472,14 @@ impl<T> Drop for SqVec<T> {
             unsafe {
                 dealloc(
                     cur_seg.read().as_ptr() as *mut u8,
-                    Layout::array::<T>(seglen as usize).unwrap_unchecked(),
+                    Layout::array::<T>(seg_len as usize).unwrap_unchecked(),
                 );
             }
 
             segs_left -= 1;
             if segs_left == 0 {
-                seglen <<= 1;
-                segs_left = (3 * seglen) >> 2;
+                seg_len <<= 1;
+                segs_left = (3 * seg_len) >> 2;
             }
 
             cur_seg = unsafe { cur_seg.add(1) };
@@ -473,7 +515,7 @@ impl<T> IndexMut<u32> for SqVec<T> {
 }
 
 impl<T: Debug> Debug for SqVec<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
@@ -508,6 +550,21 @@ impl<T: Eq> Eq for SqVec<T> {}
 mod tests {
     use super::SqVec;
     use rand::{Rng, random, rng};
+
+    #[test]
+    fn twoiter() {
+        let mut sqvec = SqVec::<u32>::new();
+        sqvec.push(2);
+        sqvec.push(3);
+
+        let mut iter = sqvec.iter();
+        assert_eq!(iter.next(), Some(&2));
+        assert_eq!(iter.next(), Some(&3));
+
+        for _ in 0..5 {
+            assert_eq!(iter.next(), None)
+        }
+    }
 
     #[test]
     fn spearfish() {
@@ -610,7 +667,7 @@ mod tests {
         while let (Some(a), Some(b)) = (viter.next(), sqiter.next()) {
             assert_eq!(a, b);
         }
-        // assert_eq!(sqiter.next(), None);
+        assert_eq!(sqiter.next(), None);
     }
 
     #[test]
@@ -645,20 +702,57 @@ mod tests {
             vec.push(r);
         }
 
-        {
-            let mut sqiter_mut = sqvec.iter_mut();
-            let mut viter_mut = vec.iter_mut();
-            while let (Some(a), Some(b)) = (viter_mut.next(), sqiter_mut.next()) {
-                let r: u32 = rng.random();
-                *a /= r;
-                *b /= r
-            }
-        }
-
-        let mut sqiter = sqvec.iter();
-        let mut viter = vec.iter();
-        while let (Some(a), Some(b)) = (viter.next(), sqiter.next()) {
+        let mut sqiter_mut = sqvec.iter_mut();
+        let mut viter_mut = vec.iter_mut();
+        while let (Some(a), Some(b)) = (viter_mut.next(), sqiter_mut.next()) {
+            let r: u32 = rng.random();
+            *a /= r;
+            *b /= r;
             assert_eq!(a, b);
         }
     }
+
+    // #[test]
+    // fn zspearfishdei() {
+    //     let sqvec: SqVec<u32> = sqvec!(2, 4, 6);
+    //     let mut siter = sqvec.iter();
+
+    //     assert_eq!(siter.next_back(), Some(&6));
+    //     assert_eq!(siter.next(), Some(&2));
+    //     assert_eq!(siter.next_back(), Some(&4));
+    // }
+
+    // #[test]
+    // fn double_ended_iterator() {
+    //     let mut rng = rng();
+    //     let mut sqvec = SqVec::<u32>::new();
+    //     let mut vec = Vec::<u32>::new();
+
+    //     for _ in 0..(1 << 16) {
+    //         let rnum: u32 = rng.random();
+    //         sqvec.push(rnum);
+    //         vec.push(rnum);
+    //     }
+
+    //     let mut sqviter = sqvec.iter();
+    //     let mut viter = vec.iter();
+
+    //     loop {
+    //         let choice: bool = rng.random();
+
+    //         if choice {
+    //             match (sqviter.next(), viter.next()) {
+    //                 (Some(x), Some(y)) => assert_eq!(x, y),
+    //                 (None, None) => break,
+    //                 _ => panic!("one iterator finished before the other"),
+    //             }
+    //         } else {
+    //             match (sqviter.next_back(), viter.next_back()) {
+    //                 (Some(x), Some(y)) => assert_eq!(x, y),
+    //                 (None, None) => break,
+    //                 _ => panic!("one iterator finished before the other"),
+    //             }
+    //         }
+    //     }
+    // }
 }
